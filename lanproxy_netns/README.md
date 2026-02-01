@@ -31,6 +31,25 @@ lanproxy-netns 是一个轻量级 HTTP/HTTPS 代理，专为这个场景设计�
 - **DHCP 指纹伪装**：可模拟 Switch 的 DHCP 特征，让 UU APP 识别为 Switch 设备
 - **访问控制**：可限制只允许特定 IP（如你的 Switch）使用代理
 
+## TCP vs UDP：这个方案的边界
+
+HTTP 代理协议只能处理 TCP 流量，这不是 lanproxy 的限制，而是协议本身的定义。但这并不影响实际使用效果：
+
+```
+Switch 网络行为：
+├── 走 HTTP 代理的流量（TCP）
+│   └── eShop、系统更新、游戏 API 请求
+│   └── → lanproxy 处理 → UU 加速
+│
+└── 直接发出的流量（不走代理）
+    └── 游戏实时数据、P2P 联机（UDP 为主）
+    └── → 直接到达 br-lan → UU 可直接加速
+```
+
+**关键点**：Switch 的 UDP 游戏流量从来不会走 HTTP 代理。这些流量直接从 Switch 发出，如果 Switch 连接在 OpenWrt 的 br-lan 上，UU 本来就能通过 PREROUTING 拦截并加速。
+
+所以 lanproxy 的 TCP-only 是"刚好够用"——它解决的是 HTTP/HTTPS 请求的加速问题，而 UDP 游戏流量走的是另一条路径。
+
 ---
 
 ## 0) 前置条件
