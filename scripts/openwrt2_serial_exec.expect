@@ -1,0 +1,34 @@
+#!/usr/bin/expect -f
+# Usage: openwrt2_serial_exec.expect "<command(s)>"
+set timeout 30
+set cmd [lindex $argv 0]
+if { $cmd eq "" } {
+    puts "usage: openwrt2_serial_exec.expect \"<command(s)>\""
+    exit 1
+}
+
+# Log everything for troubleshooting
+set script_dir [file dirname [info script]]
+set log_file "$script_dir/../logs/openwrt2_serial_exec.log"
+file mkdir [file dirname $log_file]
+log_file -a $log_file
+
+spawn nc 127.0.0.1 4444
+
+# Wake console and wait for prompt
+send "\r"
+expect {
+    -re "Please press Enter to activate this console" { send "\r"; exp_continue }
+    -re "login:" { send "root\r"; exp_continue }
+    -re "# " { }
+    timeout { send "\r"; exp_continue }
+}
+
+# Send the command(s)
+send -- "$cmd\r"
+
+# Wait for prompt to return
+expect -re "# "
+
+# Exit nc (Ctrl-])
+send "\035"

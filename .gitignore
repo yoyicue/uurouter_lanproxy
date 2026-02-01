@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+._*
+
+# Logs
+*.log
+logs/
+
+# OpenWrt images (large, can be downloaded)
+openwrt_utm/*.img
+openwrt_utm/*.img.gz
+
+# UU artifacts (third-party binaries, analysis output)
+# Contains copyrighted UU plugin binaries
+uu_artifacts/
+
+# UU installer (third-party script)
+install.sh
+
+# Compiled binaries (can be rebuilt with build.sh)
+lanproxy_netns/build/
+
+# Go build cache
+lanproxy_netns/go.sum
+
+# Temporary files
+*.tmp
+*.swp
+*~

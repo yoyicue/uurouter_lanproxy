@@ -1,0 +1,70 @@
+# lanproxy-netns configuration
+# /etc/lanproxy/config
+
+# OpenWrt bridge interface that represents the LAN.
+BR_LAN_IF="${BR_LAN_IF:-br-lan}"
+
+# Network namespace name.
+NS_NAME="${NS_NAME:-lanproxy}"
+
+# veth pair names (must be <= 15 chars).
+VETH_HOST="${VETH_HOST:-veth-lpx-br}"
+VETH_NS="${VETH_NS:-veth-lpx}"
+
+# How the netns "LAN device" gets its IP.
+# - static: set NS_ADDR directly (recommended if you don't need DHCP fingerprinting)
+# - dhcp: run udhcpc in netns to emit DHCP hostname/vendor-class for uuplugin detection,
+#         then force the default route to NS_GW (ignore upstream router option).
+NS_PROTO="${NS_PROTO:-static}"
+
+# The "LAN device" IP for the proxy (inside netns) when NS_PROTO=static.
+# Choose an unused IP in your LAN subnet.
+NS_ADDR="${NS_ADDR:-192.168.1.252/24}"
+
+# Default gateway for the netns (OpenWrt br-lan IP).
+NS_GW="${NS_GW:-192.168.1.250}"
+
+# Proxy listen address INSIDE netns (binding to 0.0.0.0 is fine).
+LISTEN="${LISTEN:-0.0.0.0:8888}"
+
+# Restrict who can use this proxy (client IP/CIDR list).
+# Recommended: lock to your Switch IP only.
+ALLOW_CLIENTS="${ALLOW_CLIENTS:-192.168.1.100/32}"
+
+# Upstream connection timeout.
+CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-15s}"
+
+# Idle timeout for CONNECT tunnels (0 = disabled).
+IDLE_TIMEOUT="${IDLE_TIMEOUT:-0}"
+
+# Verbose logging (0 or 1).
+VERBOSE="${VERBOSE:-0}"
+
+# Whether to keep netns/veth when stopping service (0 = cleanup, 1 = keep).
+KEEP_NETNS="${KEEP_NETNS:-0}"
+
+# ===== Optional: DHCP fingerprinting (when NS_PROTO=dhcp) =====
+#
+# Why: when OpenWrt's own DHCP is disabled, uuplugin often relies on sniffed DHCP
+#      (hostname/vendor-class) + traffic features to classify a device as Switch.
+#
+# Recommendation:
+# - Set UU_LEASE_MAC to a unique MAC that shares the same OUI as your real Switch (first 3 bytes),
+#   but DIFFERENT last 3 bytes (avoid MAC conflicts).
+# - Configure a DHCP reservation on your upstream DHCP server for UU_LEASE_MAC to keep IP stable.
+DHCP_REQUEST_IP="${DHCP_REQUEST_IP:-}"
+DHCP_HOSTNAME="${DHCP_HOSTNAME:-NintendoSwitch}"
+DHCP_VENDORCLASS="${DHCP_VENDORCLASS:-}"
+
+# ===== Optional: help uuplugin "see" the proxy as a LAN device =====
+# uuplugin may read these lease files to show a device in the APP.
+# If OpenWrt is not your DHCP server (bypass-gateway mode), these files might be empty/missing.
+WRITE_UU_LEASE="${WRITE_UU_LEASE:-1}"
+UU_LEASE_HOSTNAME="${UU_LEASE_HOSTNAME:-Nintendo-Switch}"
+
+# Use Nintendo OUI (98:41:5C) to help uuplugin identify as Switch.
+# Last 3 bytes are random to avoid conflict with real Switch.
+UU_LEASE_MAC="${UU_LEASE_MAC:-98:41:5C:AA:BB:CC}"
+
+UU_LEASE_FILE1="${UU_LEASE_FILE1:-/tmp/dhcp.leases}"
+UU_LEASE_FILE2="${UU_LEASE_FILE2:-/tmp/var/lib/misc/dnsmasq.leases}"

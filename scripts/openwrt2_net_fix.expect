@@ -1,0 +1,31 @@
+#!/usr/bin/expect -f
+set timeout 30
+set script_dir [file dirname [info script]]
+set log_file "$script_dir/../logs/openwrt2_net_fix.log"
+file mkdir [file dirname $log_file]
+log_file -a $log_file
+
+spawn nc 127.0.0.1 4444
+send "\r"
+
+expect {
+    -re "Please press Enter to activate this console" { send "\r"; exp_continue }
+    -re "login:" { send "root\r"; exp_continue }
+    -re "# " { }
+    timeout { send "\r"; exp_continue }
+}
+
+send "echo '=== fixing network ==='\r"
+expect -re "# "
+
+# Remove bridge device config if present, set lan to eth0 dhcp
+send "uci -q delete network.@device\[0\]; uci set network.lan.device='eth0'; uci set network.lan.proto='dhcp'; uci -q delete network.lan.ipaddr; uci -q delete network.lan.netmask; uci commit network; /etc/init.d/network restart; ip link set eth0 up; sleep 2\r"
+expect -re "# "
+
+send "udhcpc -i eth0 -n -q\r"
+expect -re "# "
+
+send "ip -4 -o addr show\r"
+expect -re "# "
+
+send "\035"

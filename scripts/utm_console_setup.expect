@@ -1,0 +1,41 @@
+#!/usr/bin/expect -f
+set timeout 30
+set script_dir [file dirname [info script]]
+set log_file "$script_dir/../logs/utm_console_setup.log"
+file mkdir [file dirname $log_file]
+log_file -a $log_file
+
+spawn utmctl attach openwrt2
+
+# Try to get to a shell prompt
+expect {
+    -re "Please press Enter to activate this console" {
+        send "\r"
+        exp_continue
+    }
+    -re "login:" {
+        send "root\r"
+        exp_continue
+    }
+    -re "# " {
+        # got shell
+    }
+    timeout {
+        send "\r"
+        exp_continue
+    }
+}
+
+# Configure LAN to DHCP on first non-lo interface
+send "iface=\$(ls /sys/class/net | grep -v lo | head -n1); echo IFACE=\$iface\r"
+expect -re "# "
+
+send "uci set network.lan.device=\"\$iface\"; uci set network.lan.ifname=\"\$iface\"; uci set network.lan.proto='dhcp'; uci commit network; /etc/init.d/network restart; sleep 2\r"
+expect -re "# "
+
+# Show IP addresses
+send "ip -4 -o addr show\r"
+expect -re "# "
+
+# End session
+send "\003"

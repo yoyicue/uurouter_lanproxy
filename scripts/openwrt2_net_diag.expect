@@ -1,0 +1,57 @@
+#!/usr/bin/expect -f
+set timeout 30
+set script_dir [file dirname [info script]]
+set log_file "$script_dir/../logs/openwrt2_net_diag.log"
+file mkdir [file dirname $log_file]
+log_file -a $log_file
+
+spawn nc 127.0.0.1 4444
+send "\r"
+
+expect {
+    -re "Please press Enter to activate this console" { send "\r"; exp_continue }
+    -re "login:" { send "root\r"; exp_continue }
+    -re "# " { }
+    timeout { send "\r"; exp_continue }
+}
+
+# Basic info
+send "echo '=== ip link ==='\r"
+expect -re "# "
+
+send "ip link\r"
+expect -re "# "
+
+send "echo '=== ip -4 a ==='\r"
+expect -re "# "
+
+send "ip -4 a\r"
+expect -re "# "
+
+send "echo '=== /etc/config/network ==='\r"
+expect -re "# "
+
+send "cat /etc/config/network\r"
+expect -re "# "
+
+# Force DHCP on eth0
+send "iface=\$(ls /sys/class/net | grep -v lo | head -n1); echo IFACE=\$iface\r"
+expect -re "# "
+
+send "uci set network.lan.device=\"\$iface\"; uci set network.lan.ifname=\"\$iface\"; uci set network.lan.proto='dhcp'; uci commit network; /etc/init.d/network restart; sleep 3\r"
+expect -re "# "
+
+send "echo '=== ip -4 a after restart ==='\r"
+expect -re "# "
+
+send "ip -4 a\r"
+expect -re "# "
+
+# Try udhcpc directly if still no IP
+send "udhcpc -i \$iface -n -q\r"
+expect -re "# "
+
+send "ip -4 a\r"
+expect -re "# "
+
+send "\035"
