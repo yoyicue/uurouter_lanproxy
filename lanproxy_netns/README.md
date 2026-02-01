@@ -31,24 +31,33 @@ lanproxy-netns 是一个轻量级 HTTP/HTTPS 代理，专为这个场景设计�
 - **DHCP 指纹伪装**：可模拟 Switch 的 DHCP 特征，让 UU APP 识别为 Switch 设备
 - **访问控制**：可限制只允许特定 IP（如你的 Switch）使用代理
 
-## TCP vs UDP：这个方案的边界
+## TCP vs UDP：这个方案的取舍
 
-HTTP 代理协议只能处理 TCP 流量，这不是 lanproxy 的限制，而是协议本身的定义。但这并不影响实际使用效果：
+**设计初衷**：Switch 设置静态 IP 和网关非常麻烦（需要手动输入 IP、子网掩码、网关、DNS），而设置 HTTP 代理只需要填代理地址和端口，简单得多。
+
+lanproxy 方案的核心优势是**零网络配置**——Switch 保持原有网络设置（DHCP 自动获取），只需添加 HTTP 代理即可。
+
+**代价**：HTTP 代理只能处理 TCP 流量。
 
 ```
 Switch 网络行为：
 ├── 走 HTTP 代理的流量（TCP）
 │   └── eShop、系统更新、游戏 API 请求
-│   └── → lanproxy 处理 → UU 加速
+│   └── → lanproxy → UU 加速 ✓
 │
 └── 直接发出的流量（不走代理）
     └── 游戏实时数据、P2P 联机（UDP 为主）
-    └── → 直接到达 br-lan → UU 可直接加速
+    └── → 原网关直接出去 → 不经过 OpenWrt → 无法加速 ✗
 ```
 
-**关键点**：Switch 的 UDP 游戏流量从来不会走 HTTP 代理。这些流量直接从 Switch 发出，如果 Switch 连接在 OpenWrt 的 br-lan 上，UU 本来就能通过 PREROUTING 拦截并加速。
+**这是一个明确的取舍**：
 
-所以 lanproxy 的 TCP-only 是"刚好够用"——它解决的是 HTTP/HTTPS 请求的加速问题，而 UDP 游戏流量走的是另一条路径。
+| 方案 | 配置复杂度 | TCP 加速 | UDP 加速 |
+|------|-----------|----------|----------|
+| lanproxy（仅设代理） | 低 | ✓ | ✗ |
+| 改 Switch 网关指向 OpenWrt | 高 | ✓ | ✓ |
+
+如果你的游戏主要依赖 UDP（大多数实时对战游戏），且对延迟敏感，可能需要考虑修改 Switch 网关。但如果主要是下载游戏、访问 eShop、或者游戏的 TCP API 请求，lanproxy 方案已经够用。
 
 ---
 
