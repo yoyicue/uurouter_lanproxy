@@ -1,4 +1,4 @@
-# lanproxy-netns (生产方案)
+# lanproxy-netns
 
 目标：让“显式 HTTP 代理”的出站流量走到 uuplugin 的 `PREROUTING iifname "br-lan"` 路径里，从而复用 UU 现有的加速规则。
 
