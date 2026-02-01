@@ -1,20 +1,35 @@
 # lanproxy-netns
 
-目标：让“显式 HTTP 代理”的出站流量走到 uuplugin 的 `PREROUTING iifname "br-lan"` 路径里，从而复用 UU 现有的加速规则。
+## 为什么需要这个？(Why)
 
-核心做法：把代理进程跑在一个 network namespace 里，并用 veth 把它当成一个真实 LAN 设备接入 `br-lan`。
+**问题**：Nintendo Switch 不支持 SOCKS 代理，只支持 HTTP 代理。而 UU 加速器的工作原理是通过 nftables 在 `PREROUTING` 链拦截来自 `br-lan` 的流量进行加速。
 
-这样代理的外连在 OpenWrt 看起来就是：
-
-```
-(netns:lanproxy) 192.168.1.252  --->  br-lan(PREROUTING)  --->  uuplugin DNAT :60000  --->  WAN
-```
-
-而不是传统代理的：
+如果直接在 OpenWrt 上运行 HTTP 代理：
 
 ```
-OpenWrt 本机进程(OUTPUT)  --->  WAN   (不会命中 uuplugin 的 PREROUTING/iif 规则)
+Switch  --->  OpenWrt 代理进程  --->  OUTPUT 链  --->  WAN
+                                      ↑
+                                 不经过 PREROUTING，UU 规则不生效
 ```
+
+代理进程的出站流量走的是 `OUTPUT` 链（本机进程），而不是 `PREROUTING`（外部设备），所以 UU 的加速规则完全不会命中。
+
+## 这是什么？(What)
+
+**解决方案**：把代理进程放进一个独立的 network namespace，通过 veth pair 接入 `br-lan`，让它在网络层面表现得像一台独立的 LAN 设备。
+
+```
+Switch  --->  OpenWrt 代理进程(netns)  --->  veth  --->  br-lan  --->  PREROUTING  --->  UU 加速  --->  WAN
+              192.168.1.252                                            ↑
+                                                                  现在能命中 UU 规则了
+```
+
+lanproxy-netns 是一个轻量级 HTTP/HTTPS 代理，专为这个场景设计：
+
+- **network namespace 隔离**：代理进程的网络栈与主机隔离，出站流量走 `br-lan`
+- **veth pair 桥接**：netns 通过虚拟网卡对接入 LAN 网桥，获得真实 LAN IP
+- **DHCP 指纹伪装**：可模拟 Switch 的 DHCP 特征，让 UU APP 识别为 Switch 设备
+- **访问控制**：可限制只允许特定 IP（如你的 Switch）使用代理
 
 ---
 
@@ -249,7 +264,31 @@ uuplugin 通过多层逻辑识别 Switch：
 
 ---
 
-## 7) UU 加速机制
+## 7) 技术实现
+
+### 超时处理
+
+代理使用动态 deadline 机制：每次读写操作都会刷新超时计时器。这确保了：
+
+- 大文件下载不会因为固定超时而中断（只要数据持续流动就不会超时）
+- 空闲连接在 30 秒无活动后自动关闭
+- CONNECT 隧道（HTTPS）和普通 HTTP 请求都支持
+
+### HTTP 代理
+
+- 支持 HTTP/1.1 keep-alive 复用连接
+- CONNECT 方法用于 HTTPS 隧道
+- 正确解析和转发 HTTP 响应头
+
+### 错误处理
+
+- netns.sh DHCP 超时会返回错误状态码
+- init 脚本检查 netns 返回值，失败时阻止服务启动
+- 详细日志输出到 syslog（`logread | grep lanproxy`）
+
+---
+
+## 8) UU 加速机制
 
 当 UU APP 为设备开启加速后，uuplugin 会：
 
