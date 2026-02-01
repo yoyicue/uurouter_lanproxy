@@ -118,6 +118,8 @@ start() {
     i=$((i + 1))
     sleep 1
   done
+  echo "[lanproxy-netns] DHCP timeout: no IPv4 address on $VETH_NS" >&2
+  return 1
 }
 
 stop() {

@@ -18,7 +18,11 @@ import (
 	"time"
 )
 
-const defaultAllow = "192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
+const (
+	defaultAllow    = "192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
+	headerTimeout   = 30 * time.Second
+	httpBodyTimeout = 30 * time.Second
+)
 
 var (
 	listenAddr     string
@@ -85,7 +89,7 @@ func handleConn(c net.Conn) {
 		return
 	}
 
-	_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
+	_ = c.SetReadDeadline(time.Now().Add(headerTimeout))
 	br := bufio.NewReader(c)
 
 	for {
@@ -106,10 +110,14 @@ func handleConn(c net.Conn) {
 			return // CONNECT turns into a tunnel; no more HTTP requests on this conn
 		}
 
-		if err := handleHTTP(c, ip, req); err != nil {
+		closeAfter, err := handleHTTP(c, ip, req)
+		if err != nil {
 			if verbose {
 				log.Printf("HTTP from %s: %v", ip, err)
 			}
+			return
+		}
+		if closeAfter {
 			return
 		}
 
@@ -117,7 +125,7 @@ func handleConn(c net.Conn) {
 		if shouldClose(req) {
 			return
 		}
-		_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
+		_ = c.SetReadDeadline(time.Now().Add(headerTimeout))
 	}
 }
 
@@ -153,12 +161,12 @@ func handleConnect(clientConn net.Conn, clientReader *bufio.Reader, clientIP net
 	relayWithBufferedReader(clientConn, clientReader, up, idleTimeout)
 }
 
-func handleHTTP(clientConn net.Conn, clientIP net.IP, req *http.Request) error {
+func handleHTTP(clientConn net.Conn, clientIP net.IP, req *http.Request) (bool, error) {
 	// Determine upstream host/port.
 	targetHost, targetPort, err := resolveHTTPUpstream(req)
 	if err != nil {
 		_ = sendError(clientConn, http.StatusBadRequest)
-		return err
+		return true, err
 	}
 	targetAddr := net.JoinHostPort(targetHost, targetPort)
 
@@ -170,7 +178,7 @@ func handleHTTP(clientConn net.Conn, clientIP net.IP, req *http.Request) error {
 	up, err := d.Dial("tcp", targetAddr)
 	if err != nil {
 		_ = sendError(clientConn, http.StatusBadGateway)
-		return fmt.Errorf("dial upstream %s: %w", targetAddr, err)
+		return true, fmt.Errorf("dial upstream %s: %w", targetAddr, err)
 	}
 	defer up.Close()
 
@@ -182,13 +190,45 @@ func handleHTTP(clientConn net.Conn, clientIP net.IP, req *http.Request) error {
 	// Per net/http rules for client requests.
 	req.RequestURI = ""
 
-	if err := req.Write(up); err != nil {
-		_ = sendError(clientConn, http.StatusBadGateway)
-		return fmt.Errorf("write upstream: %w", err)
+	// If the client asked to close, signal upstream too.
+	if shouldClose(req) {
+		req.Close = true
 	}
 
-	_, err = io.Copy(clientConn, up)
-	return err
+	if req.Body != nil && req.Body != http.NoBody {
+		req.Body = deadlineReadCloser{ReadCloser: req.Body, conn: clientConn, idle: httpBodyTimeout}
+		defer req.Body.Close()
+	}
+
+	if err := req.Write(up); err != nil {
+		_ = sendError(clientConn, http.StatusBadGateway)
+		return true, fmt.Errorf("write upstream: %w", err)
+	}
+	_ = clientConn.SetReadDeadline(time.Time{})
+
+	upReader := bufio.NewReader(deadlineReader{r: up, conn: up, idle: httpBodyTimeout})
+	resp, err := http.ReadResponse(upReader, req)
+	if err != nil {
+		_ = sendError(clientConn, http.StatusBadGateway)
+		return true, fmt.Errorf("read upstream response: %w", err)
+	}
+	if resp.Body != nil && resp.Body != http.NoBody {
+		resp.Body = deadlineReadCloser{ReadCloser: resp.Body, conn: up, idle: httpBodyTimeout}
+		defer resp.Body.Close()
+	}
+
+	closeAfter := shouldClose(req) || resp.Close
+	if closeAfter {
+		resp.Close = true
+		resp.Header.Set("Connection", "close")
+	}
+
+	writer := deadlineWriter{w: clientConn, conn: clientConn, idle: httpBodyTimeout}
+	if err := resp.Write(writer); err != nil {
+		return true, err
+	}
+	_ = clientConn.SetWriteDeadline(time.Time{})
+	return closeAfter, nil
 }
 
 func resolveHTTPUpstream(req *http.Request) (host, port string, err error) {
@@ -242,17 +282,18 @@ func splitHostPortDefault(hostport, defaultPort string) (host, port string, err 
 }
 
 func relayWithBufferedReader(down net.Conn, downReader *bufio.Reader, up net.Conn, idle time.Duration) {
-	if idle > 0 {
-		_ = down.SetDeadline(time.Now().Add(idle))
-		_ = up.SetDeadline(time.Now().Add(idle))
-	}
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(up, downReader) // include bytes already buffered by ReadRequest
+		r := io.Reader(downReader)
+		w := io.Writer(up)
+		if idle > 0 {
+			r = deadlineReader{r: downReader, conn: down, idle: idle}
+			w = deadlineWriter{w: up, conn: up, idle: idle}
+		}
+		_, _ = io.Copy(w, r) // include bytes already buffered by ReadRequest
 		if tc, ok := up.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
@@ -260,13 +301,58 @@ func relayWithBufferedReader(down net.Conn, downReader *bufio.Reader, up net.Con
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(down, up)
+		r := io.Reader(up)
+		w := io.Writer(down)
+		if idle > 0 {
+			r = deadlineReader{r: up, conn: up, idle: idle}
+			w = deadlineWriter{w: down, conn: down, idle: idle}
+		}
+		_, _ = io.Copy(w, r)
 		if tc, ok := down.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
 	}()
 
 	wg.Wait()
+}
+
+type deadlineReader struct {
+	r    io.Reader
+	conn net.Conn
+	idle time.Duration
+}
+
+func (d deadlineReader) Read(p []byte) (int, error) {
+	if d.idle > 0 {
+		_ = d.conn.SetReadDeadline(time.Now().Add(d.idle))
+	}
+	return d.r.Read(p)
+}
+
+type deadlineWriter struct {
+	w    io.Writer
+	conn net.Conn
+	idle time.Duration
+}
+
+func (d deadlineWriter) Write(p []byte) (int, error) {
+	if d.idle > 0 {
+		_ = d.conn.SetWriteDeadline(time.Now().Add(d.idle))
+	}
+	return d.w.Write(p)
+}
+
+type deadlineReadCloser struct {
+	io.ReadCloser
+	conn net.Conn
+	idle time.Duration
+}
+
+func (d deadlineReadCloser) Read(p []byte) (int, error) {
+	if d.idle > 0 {
+		_ = d.conn.SetReadDeadline(time.Now().Add(d.idle))
+	}
+	return d.ReadCloser.Read(p)
 }
 
 func parseAllowList(s string) ([]*net.IPNet, error) {
@@ -276,7 +362,8 @@ func parseAllowList(s string) ([]*net.IPNet, error) {
 	}
 	if s == "*" {
 		_, all4, _ := net.ParseCIDR("0.0.0.0/0")
-		return []*net.IPNet{all4}, nil
+		_, all6, _ := net.ParseCIDR("::/0")
+		return []*net.IPNet{all4, all6}, nil
 	}
 
 	var out []*net.IPNet

@@ -44,7 +44,12 @@ start_service() {
 	# Setup netns/veth before starting the proxy.
 	export BR_LAN_IF NS_NAME VETH_HOST VETH_NS NS_PROTO NS_ADDR NS_GW UU_LEASE_MAC KEEP_NETNS
 	export DHCP_REQUEST_IP DHCP_HOSTNAME DHCP_VENDORCLASS
-	[ -x "$NETNS_SH" ] && "$NETNS_SH" start
+	if [ -x "$NETNS_SH" ]; then
+		if ! "$NETNS_SH" start; then
+			logger -t lanproxy "netns setup failed"
+			return 1
+		fi
+	fi
 
 	# Optional: write a local lease entry for uuplugin device discovery.
 	export NS_NAME VETH_NS NS_ADDR
