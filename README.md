@@ -1,8 +1,28 @@
-# UU Router - Nintendo Switch 加速方案
+# UU Router - 软路由 + UU加速器 Nintendo Switch 加速方案
 
-通过 UTM + OpenWrt + UU加速器 为 Nintendo Switch 实现游戏加速。
+适用于 **Mac mini、NUC 等软路由场景**，通过虚拟机运行 OpenWrt + UU加速器，为 Nintendo Switch 实现游戏加速。
 
-## 方案
+## 适用场景
+
+- 没有支持 UU 的硬件路由器，但有 Mac mini / NUC / 小主机等常开设备
+- 想使用 UU 加速器，但不想购买额外的路由器硬件
+- 已有复杂网络环境（主路由不可替换），需要旁路网关方案
+
+## 工作原理
+
+```
+[Nintendo Switch]
+       │
+       ▼ (网关指向 OpenWrt)
+[OpenWrt 虚拟机] ← UU 加速器插件
+       │
+       ▼ (TUN 隧道)
+[UU 服务器] → 游戏服务器
+```
+
+在 Mac mini 等设备上通过 UTM/VMware/Proxmox 运行 OpenWrt 虚拟机，安装 UU 加速器插件，Switch 将网关指向 OpenWrt 即可享受加速。
+
+## 加速方案
 
 | 方案 | 说明 | 状态 |
 |------|------|------|
@@ -11,11 +31,12 @@
 
 ## 快速开始
 
-### 网关模式 (最简单)
+### 网关模式 (推荐)
 
-1. 在 UTM 中运行 OpenWrt 虚拟机
-2. 安装 UU 加速器插件
-3. Switch 网关设为 OpenWrt LAN IP
+1. 在虚拟化平台 (UTM/VMware/Proxmox) 中运行 OpenWrt
+2. 配置 OpenWrt 为旁路网关模式 (与主网络同网段)
+3. 安装 UU 加速器插件
+4. Switch 网关手动设为 OpenWrt LAN IP
 
 详见: [docs/utm_openwrt_uu_switch.md](docs/utm_openwrt_uu_switch.md)
 
@@ -29,6 +50,16 @@
 
 详见: [lanproxy_netns/README.md](lanproxy_netns/README.md) | [成功配置](docs/lanproxy_success.md)
 
+## 环境要求
+
+| 组件 | 说明 |
+|------|------|
+| 宿主机 | Mac mini / NUC / 小主机等常开设备 |
+| 虚拟化 | UTM (macOS) / VMware / Proxmox / QEMU |
+| OpenWrt | ARM64 或 x86_64 镜像 |
+| UU 加速器 | 手机 APP + 路由器插件 |
+| Switch | 建议使用有线网卡 |
+
 ## 目录结构
 
 ```
@@ -40,7 +71,7 @@
 │   ├── main.go              # 代理源码
 │   ├── build.sh             # 编译脚本
 │   └── deploy.sh            # 部署脚本
-└── scripts/                 # 辅助脚本
+└── scripts/                 # OpenWrt 辅助脚本
 ```
 
 ## 文档索引
@@ -52,23 +83,6 @@
 | [uu_device_identification.md](docs/uu_device_identification.md) | UU 设备识别机制 |
 | [uu_switch_detection_logic.md](docs/uu_switch_detection_logic.md) | Switch 检测逻辑 |
 | [uu_accel_analysis.md](docs/uu_accel_analysis.md) | uuplugin 分析 |
-
-## 网络拓扑
-
-```
-[Nintendo Switch] ──(代理/网关)──> [OpenWrt + UU] ──> [互联网]
-                                        │
-                                   TUN 隧道加速
-                                        │
-                                   [UU 服务器]
-```
-
-## 环境要求
-
-- macOS + UTM (或其他虚拟化方案)
-- OpenWrt ARM64 镜像
-- UU 加速器 APP + 路由器插件
-- Nintendo Switch + 有线网卡
 
 ## License
 
