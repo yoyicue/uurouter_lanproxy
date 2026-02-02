@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,6 +24,10 @@ const (
 	defaultAllow    = "192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
 	headerTimeout   = 30 * time.Second
 	httpBodyTimeout = 30 * time.Second
+	copyBufSize     = 32 * 1024
+	maxIdleConns    = 64
+	maxIdlePerHost  = 8
+	idleConnTimeout = 90 * time.Second
 )
 
 var (
@@ -32,6 +38,14 @@ var (
 	verbose        bool
 
 	allowedNets []*net.IPNet
+	transport   *http.Transport
+
+	writerPool = sync.Pool{
+		New: func() any { return bufio.NewWriterSize(io.Discard, copyBufSize) },
+	}
+	copyBufPool = sync.Pool{
+		New: func() any { return make([]byte, copyBufSize) },
+	}
 )
 
 func init() {
@@ -50,6 +64,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Invalid -allow: %v", err)
 	}
+	transport = newUpstreamTransport(connectTimeout, httpBodyTimeout)
 
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -162,25 +177,15 @@ func handleConnect(clientConn net.Conn, clientReader *bufio.Reader, clientIP net
 }
 
 func handleHTTP(clientConn net.Conn, clientIP net.IP, req *http.Request) (bool, error) {
-	// Determine upstream host/port.
-	targetHost, targetPort, err := resolveHTTPUpstream(req)
+	targetAddr, err := normalizeProxyRequest(req)
 	if err != nil {
 		_ = sendError(clientConn, http.StatusBadRequest)
 		return true, err
 	}
-	targetAddr := net.JoinHostPort(targetHost, targetPort)
 
 	if verbose {
 		log.Printf("[HTTP] %s %s -> %s", clientIP, req.Method, targetAddr)
 	}
-
-	d := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
-	up, err := d.Dial("tcp", targetAddr)
-	if err != nil {
-		_ = sendError(clientConn, http.StatusBadGateway)
-		return true, fmt.Errorf("dial upstream %s: %w", targetAddr, err)
-	}
-	defer up.Close()
 
 	// Remove proxy-only headers.
 	req.Header.Del("Proxy-Connection")
@@ -196,26 +201,15 @@ func handleHTTP(clientConn net.Conn, clientIP net.IP, req *http.Request) (bool, 
 	}
 
 	if req.Body != nil && req.Body != http.NoBody {
-		req.Body = deadlineReadCloser{ReadCloser: req.Body, conn: clientConn, idle: httpBodyTimeout}
-		defer req.Body.Close()
+		req.Body = &deadlineReadCloser{ReadCloser: req.Body, conn: clientConn, idle: httpBodyTimeout}
 	}
 
-	if err := req.Write(up); err != nil {
-		_ = sendError(clientConn, http.StatusBadGateway)
-		return true, fmt.Errorf("write upstream: %w", err)
-	}
-	_ = clientConn.SetReadDeadline(time.Time{})
-
-	upReader := bufio.NewReader(deadlineReader{r: up, conn: up, idle: httpBodyTimeout})
-	resp, err := http.ReadResponse(upReader, req)
+	resp, err := transport.RoundTrip(req)
 	if err != nil {
 		_ = sendError(clientConn, http.StatusBadGateway)
-		return true, fmt.Errorf("read upstream response: %w", err)
+		return true, fmt.Errorf("roundtrip %s: %w", targetAddr, err)
 	}
-	if resp.Body != nil && resp.Body != http.NoBody {
-		resp.Body = deadlineReadCloser{ReadCloser: resp.Body, conn: up, idle: httpBodyTimeout}
-		defer resp.Body.Close()
-	}
+	defer resp.Body.Close()
 
 	closeAfter := shouldClose(req) || resp.Close
 	if closeAfter {
@@ -223,12 +217,76 @@ func handleHTTP(clientConn net.Conn, clientIP net.IP, req *http.Request) (bool, 
 		resp.Header.Set("Connection", "close")
 	}
 
-	writer := deadlineWriter{w: clientConn, conn: clientConn, idle: httpBodyTimeout}
-	if err := resp.Write(writer); err != nil {
+	bw := writerPool.Get().(*bufio.Writer)
+	bw.Reset(clientConn)
+	defer func() {
+		bw.Reset(io.Discard)
+		writerPool.Put(bw)
+	}()
+
+	var w io.Writer = bw
+	if httpBodyTimeout > 0 {
+		w = &deadlineWriter{w: bw, conn: clientConn, idle: httpBodyTimeout}
+	}
+
+	if err := resp.Write(w); err != nil {
 		return true, err
 	}
-	_ = clientConn.SetWriteDeadline(time.Time{})
+	if err := bw.Flush(); err != nil {
+		return true, err
+	}
 	return closeAfter, nil
+}
+
+func normalizeProxyRequest(req *http.Request) (string, error) {
+	if req.URL == nil {
+		return "", errors.New("missing URL")
+	}
+
+	targetHost, targetPort, err := resolveHTTPUpstream(req)
+	if err != nil {
+		return "", err
+	}
+	targetAddr := net.JoinHostPort(targetHost, targetPort)
+
+	if req.URL.Scheme == "" {
+		req.URL.Scheme = "http"
+	} else if strings.EqualFold(req.URL.Scheme, "https") {
+		// Preserve old behavior: no TLS, but keep 443 if https was specified.
+		req.URL.Scheme = "http"
+	}
+	req.URL.Host = targetAddr
+	if req.Host == "" {
+		req.Host = targetHost
+	}
+	return targetAddr, nil
+}
+
+func newUpstreamTransport(connectTimeout, idle time.Duration) *http.Transport {
+	dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+	return &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialWithDeadline(ctx, dialer, network, addr, idle)
+		},
+		DisableCompression:    true,
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          maxIdleConns,
+		MaxIdleConnsPerHost:   maxIdlePerHost,
+		IdleConnTimeout:       idleConnTimeout,
+		ResponseHeaderTimeout: headerTimeout,
+	}
+}
+
+func dialWithDeadline(ctx context.Context, dialer *net.Dialer, network, addr string, idle time.Duration) (net.Conn, error) {
+	c, err := dialer.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	if idle <= 0 {
+		return c, nil
+	}
+	return &deadlineConn{Conn: c, idle: idle}, nil
 }
 
 func resolveHTTPUpstream(req *http.Request) (host, port string, err error) {
@@ -287,13 +345,16 @@ func relayWithBufferedReader(down net.Conn, downReader *bufio.Reader, up net.Con
 
 	go func() {
 		defer wg.Done()
+		buf := copyBufPool.Get().([]byte)
+		defer copyBufPool.Put(buf)
+
 		r := io.Reader(downReader)
 		w := io.Writer(up)
 		if idle > 0 {
-			r = deadlineReader{r: downReader, conn: down, idle: idle}
-			w = deadlineWriter{w: up, conn: up, idle: idle}
+			r = &deadlineReader{r: downReader, conn: down, idle: idle}
+			w = &deadlineWriter{w: up, conn: up, idle: idle}
 		}
-		_, _ = io.Copy(w, r) // include bytes already buffered by ReadRequest
+		_, _ = io.CopyBuffer(w, r, buf) // include bytes already buffered by ReadRequest
 		if tc, ok := up.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
@@ -301,13 +362,16 @@ func relayWithBufferedReader(down net.Conn, downReader *bufio.Reader, up net.Con
 
 	go func() {
 		defer wg.Done()
+		buf := copyBufPool.Get().([]byte)
+		defer copyBufPool.Put(buf)
+
 		r := io.Reader(up)
 		w := io.Writer(down)
 		if idle > 0 {
-			r = deadlineReader{r: up, conn: up, idle: idle}
-			w = deadlineWriter{w: down, conn: down, idle: idle}
+			r = &deadlineReader{r: up, conn: up, idle: idle}
+			w = &deadlineWriter{w: down, conn: down, idle: idle}
 		}
-		_, _ = io.Copy(w, r)
+		_, _ = io.CopyBuffer(w, r, buf)
 		if tc, ok := down.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
@@ -316,15 +380,51 @@ func relayWithBufferedReader(down net.Conn, downReader *bufio.Reader, up net.Con
 	wg.Wait()
 }
 
+type deadlineConn struct {
+	net.Conn
+	idle      time.Duration
+	lastRead  int64
+	lastWrite int64
+}
+
+func (d *deadlineConn) Read(p []byte) (int, error) {
+	if d.idle > 0 {
+		now := time.Now()
+		last := atomic.LoadInt64(&d.lastRead)
+		if last == 0 || now.Sub(time.Unix(0, last)) > d.idle/2 {
+			_ = d.Conn.SetReadDeadline(now.Add(d.idle))
+			atomic.StoreInt64(&d.lastRead, now.UnixNano())
+		}
+	}
+	return d.Conn.Read(p)
+}
+
+func (d *deadlineConn) Write(p []byte) (int, error) {
+	if d.idle > 0 {
+		now := time.Now()
+		last := atomic.LoadInt64(&d.lastWrite)
+		if last == 0 || now.Sub(time.Unix(0, last)) > d.idle/2 {
+			_ = d.Conn.SetWriteDeadline(now.Add(d.idle))
+			atomic.StoreInt64(&d.lastWrite, now.UnixNano())
+		}
+	}
+	return d.Conn.Write(p)
+}
+
 type deadlineReader struct {
 	r    io.Reader
 	conn net.Conn
 	idle time.Duration
+	last time.Time
 }
 
-func (d deadlineReader) Read(p []byte) (int, error) {
+func (d *deadlineReader) Read(p []byte) (int, error) {
 	if d.idle > 0 {
-		_ = d.conn.SetReadDeadline(time.Now().Add(d.idle))
+		now := time.Now()
+		if d.last.IsZero() || now.Sub(d.last) > d.idle/2 {
+			_ = d.conn.SetReadDeadline(now.Add(d.idle))
+			d.last = now
+		}
 	}
 	return d.r.Read(p)
 }
@@ -333,11 +433,16 @@ type deadlineWriter struct {
 	w    io.Writer
 	conn net.Conn
 	idle time.Duration
+	last time.Time
 }
 
-func (d deadlineWriter) Write(p []byte) (int, error) {
+func (d *deadlineWriter) Write(p []byte) (int, error) {
 	if d.idle > 0 {
-		_ = d.conn.SetWriteDeadline(time.Now().Add(d.idle))
+		now := time.Now()
+		if d.last.IsZero() || now.Sub(d.last) > d.idle/2 {
+			_ = d.conn.SetWriteDeadline(now.Add(d.idle))
+			d.last = now
+		}
 	}
 	return d.w.Write(p)
 }
@@ -346,11 +451,16 @@ type deadlineReadCloser struct {
 	io.ReadCloser
 	conn net.Conn
 	idle time.Duration
+	last time.Time
 }
 
-func (d deadlineReadCloser) Read(p []byte) (int, error) {
+func (d *deadlineReadCloser) Read(p []byte) (int, error) {
 	if d.idle > 0 {
-		_ = d.conn.SetReadDeadline(time.Now().Add(d.idle))
+		now := time.Now()
+		if d.last.IsZero() || now.Sub(d.last) > d.idle/2 {
+			_ = d.conn.SetReadDeadline(now.Add(d.idle))
+			d.last = now
+		}
 	}
 	return d.ReadCloser.Read(p)
 }
