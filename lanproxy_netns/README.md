@@ -61,19 +61,19 @@ Switch 网络行为：
 
 如果你的游戏主要依赖 UDP（大多数实时对战游戏），且对延迟敏感，可能需要考虑修改 Switch 网关。但如果主要是下载游戏、访问 eShop、或者游戏的 TCP API 请求，lanproxy 方案已经够用。
 
-### 实测性能对比
+### 性能对比（稳定样本）
 
-在同一台 OpenWrt 设备上，同时下载游戏的场景下实测：
+在同一台 OpenWrt 上做 5 轮对比，每轮 8 秒采样，取中位数（2026-02-04）：
 
-```
-lanproxy（用户态代理）:  ~10 Mbps
-UU 二进制（内核转发）:   ~11 Mbps
-差异:                    ~10%
-```
+- lanproxy（HTTP 代理路径）：`eth0 rx 54.30 Mbps`，`tun164 rx 54.14 Mbps`
+- 直接 UU（二进制/网关路径，无代理）：`eth0 rx 54.20 Mbps`，`tun164 rx 54.19 Mbps`
+- 差异：`<0.2%`（可视为同级）
 
-虽然 lanproxy 存在理论上的额外开销（用户态中转、TCP-over-TCP），但实测表明瓶颈在 UU 隧道服务端带宽，而非代理本身。两种方案的下载速度几乎一致。
+说明：该对比使用同一下载源（BigBuckBunny.mp4），lanproxy 走代理路径，direct 为 netns 直连；两者均走 UU 隧道（tun164），主要反映代理带来的额外开销。
 
-> 测试方法：通过 `/proc/net/dev` 采样 veth/tun 接口流量，取 10 秒平均值。
+> 测试方法：通过 `/proc/net/dev` 采样 veth/tun 接口流量，取平均值（建议多轮取中位数）。
+>
+> 复现脚本与步骤：`scripts/uu_ifrate.sh`、`docs/perf_lanproxy_vs_direct.md`。
 
 ---
 
