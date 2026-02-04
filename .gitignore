@@ -19,6 +19,7 @@ install.sh
 
 # Compiled binaries (can be rebuilt with build.sh)
 lanproxy_netns/build/
+lanproxy_netns/lanproxy
 
 # Go build cache
 lanproxy_netns/go.sum
